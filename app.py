@@ -24,8 +24,12 @@ PDF_TEXT_FIELDS = {
     "movil": (68, 524, 140, 10),
     "correo": (308, 524, 225, 9),
 }
-CHECKBOX_S01 = (223, 445)       # centro de la casilla "S01 Sin efectos Fiscales"
-CHECKBOX_WHATSAPP = (238, 237)  # centro de la casilla "WhatsApp" (medio de notificación)
+CHECKBOX_S01 = (223, 445)          # centro de la casilla "S01 Sin efectos Fiscales"
+SIGNATURE_NAME = (305.9, 98, 470)  # centro de la línea "Nombre / firma / fecha" (x, y, ancho_max)
+# Rectángulo que cubre la casilla "WhatsApp": el PDF plantilla que compartiste ya
+# trae una "x" fija ahí (no la pone este código); se blanquea esa zona para que
+# el resultado final salga sin marcar. (x0, y0, ancho, alto, en coords. reportlab)
+WHATSAPP_BOX_COVER = (226, 227, 24, 19)
 
 
 def draw_fitted_text(c, x, y, text, max_width, base_size=10, min_size=6, font="Helvetica"):
@@ -49,13 +53,29 @@ def fill_pdf(template_bytes: bytes, data: dict) -> bytes:
     overlay_buffer = io.BytesIO()
     c = canvas.Canvas(overlay_buffer, pagesize=(width, height))
 
+    # Blanquea la casilla "WhatsApp" para tapar la "x" que trae la plantilla original,
+    # y vuelve a dibujar el borde de la casilla (vacía) para no perder el recuadro.
+    c.setFillColorRGB(1, 1, 1)
+    c.rect(*WHATSAPP_BOX_COVER, fill=1, stroke=0)
+    c.setFillColorRGB(0, 0, 0)
+    c.setLineWidth(0.75)
+    c.rect(*WHATSAPP_BOX_COVER, fill=0, stroke=1)
+
     for key, (x, y, max_w, size) in PDF_TEXT_FIELDS.items():
         draw_fitted_text(c, x, y, data.get(key, ""), max_w, base_size=size)
 
-    # Marcas fijas requeridas: S01 (Sin efectos Fiscales) y WhatsApp
+    # Marca fija requerida: S01 (Sin efectos Fiscales)
     c.setFont("Helvetica-Bold", 11)
     c.drawCentredString(*CHECKBOX_S01, "X")
-    c.drawCentredString(*CHECKBOX_WHATSAPP, "X")
+
+    # Nombre del cliente en la línea de "Nombre / firma / fecha"
+    x_sig, y_sig, max_w_sig = SIGNATURE_NAME
+    nombre_txt = data.get("nombre", "")
+    size = 10
+    while size > 6 and c.stringWidth(nombre_txt, "Helvetica", size) > max_w_sig:
+        size -= 0.5
+    c.setFont("Helvetica", size)
+    c.drawCentredString(x_sig, y_sig, nombre_txt)
 
     c.save()
     overlay_buffer.seek(0)
