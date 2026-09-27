@@ -31,6 +31,28 @@ SIGNATURE_NAME = (305.9, 98, 470)  # centro de la línea "Nombre / firma / fecha
 # el resultado final salga sin marcar. (x0, y0, ancho, alto, en coords. reportlab)
 WHATSAPP_BOX_COVER = (226, 227, 24, 19)
 
+# ----------------------------------------------------------------------------
+# Coordenadas del formato de PEDIDO (también PDF plano, sin campos interactivos).
+# Calibradas sobre el PDF de ejemplo que compartiste (página carta, 612x792 pts).
+# ----------------------------------------------------------------------------
+PEDIDO_TEXT_FIELDS = {
+    # clave interna: (x, y, ancho_max, tamaño_fuente)
+    "serie": (176, 603, 86, 10),
+    "modelo": (299, 603, 40, 10),
+    "color_ext": (77, 592, 205, 10),
+}
+# 5 filas de depósitos: cada una (x_fecha, x_monto, x_rec, y, ancho_fecha, ancho_rec)
+# La fila 1 comparte línea con las etiquetas "Fecha Depto." y "Rec.", así que sus
+# casillas de valor son más angostas y arrancan más a la derecha que las filas 2-5.
+PEDIDO_DEPOSITO_ROWS = [
+    (80, 127, 192, 342, 29, 50),
+    (30, 127, 179, 331, 79, 63),
+    (30, 127, 179, 319, 79, 63),
+    (30, 127, 179, 308, 79, 63),
+    (30, 127, 179, 297, 79, 63),
+]
+PEDIDO_DEPOSITO_ANCHO_MONTO = 42
+
 
 def draw_fitted_text(c, x, y, text, max_width, base_size=10, min_size=6, font="Helvetica"):
     """Dibuja texto reduciendo el tamaño de fuente si no cabe en max_width."""
@@ -86,6 +108,46 @@ def fill_pdf(template_bytes: bytes, data: dict) -> bytes:
     writer = PdfWriter()
     writer.add_page(page)
     # Si el PDF original tuviera más páginas, se agregan tal cual
+    for p in reader.pages[1:]:
+        writer.add_page(p)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def fill_pedido_pdf(template_bytes: bytes, serie: str, modelo: str, color_ext: str,
+                     depositos: list, autorizacion: str) -> bytes:
+    """Llena el formato de Pedido: Serie, Modelo (año), Color Ext., hasta 5 filas
+    de depósito (fecha, monto, rec.) y la línea de Autorización Depósito."""
+    reader = PdfReader(io.BytesIO(template_bytes))
+    page = reader.pages[0]
+    width = float(page.mediabox.width)
+    height = float(page.mediabox.height)
+
+    overlay_buffer = io.BytesIO()
+    c = canvas.Canvas(overlay_buffer, pagesize=(width, height))
+
+    vehiculo = {"serie": serie, "modelo": modelo, "color_ext": color_ext}
+    for key, (x, y, max_w, size) in PEDIDO_TEXT_FIELDS.items():
+        draw_fitted_text(c, x, y, vehiculo.get(key, ""), max_w, base_size=size)
+
+    for (x_fecha, x_monto, x_rec, y, ancho_fecha, ancho_rec), dep in zip(PEDIDO_DEPOSITO_ROWS, depositos):
+        draw_fitted_text(c, x_fecha, y, dep.get("fecha", ""), ancho_fecha, base_size=9)
+        draw_fitted_text(c, x_monto, y, dep.get("monto", ""), PEDIDO_DEPOSITO_ANCHO_MONTO, base_size=9)
+        draw_fitted_text(c, x_rec, y, dep.get("rec", ""), ancho_rec, base_size=9)
+
+    x_a, y_a, max_w_a, size_a = PEDIDO_AUTORIZACION
+    draw_fitted_text(c, x_a, y_a, autorizacion, max_w_a, base_size=size_a)
+
+    c.save()
+    overlay_buffer.seek(0)
+
+    overlay_reader = PdfReader(overlay_buffer)
+    page.merge_page(overlay_reader.pages[0])
+
+    writer = PdfWriter()
+    writer.add_page(page)
     for p in reader.pages[1:]:
         writer.add_page(p)
 
@@ -193,6 +255,7 @@ with col_up1:
     excel_file = st.file_uploader("Excel de seguimiento (.xlsx)", type=["xlsx"])
 with col_up2:
     pdf_file = st.file_uploader("Formato ANEXO 1 - CFDI (.pdf)", type=["pdf"])
+pedido_file = st.file_uploader("Formato de Pedido (.pdf) — opcional", type=["pdf"])
 
 st.divider()
 
@@ -228,6 +291,29 @@ with st.form("form_cliente", clear_on_submit=False):
     unidad = st.text_input("Descripción de la unidad", placeholder='Ej. "Hilux SR, 2027, color gris, manual"')
     valor_factura = st.text_input("Valor factura")
 
+    st.subheader("Formato de Pedido (opcional)")
+    st.caption("Solo se usa si subiste el PDF del Pedido arriba.")
+    cp1, cp2, cp3 = st.columns(3)
+    with cp1:
+        serie = st.text_input("Serie")
+    with cp2:
+        modelo = st.text_input("Modelo (año)")
+    with cp3:
+        color_ext = st.text_input("Color Ext.")
+
+    st.markdown("**Depósitos** (hasta 5 filas)")
+    depositos = []
+    for i in range(5):
+        dc1, dc2, dc3 = st.columns(3)
+        with dc1:
+            f = st.text_input(f"Fecha {i + 1}", key=f"dep_fecha_{i}")
+        with dc2:
+            m = st.text_input(f"$ {i + 1}", key=f"dep_monto_{i}")
+        with dc3:
+            r = st.text_input(f"Rec. {i + 1}", key=f"dep_rec_{i}")
+        depositos.append({"fecha": f, "monto": m, "rec": r})
+    autorizacion = st.text_input("Autorización Depósito")
+
     submitted = st.form_submit_button("Procesar y Generar Archivos", use_container_width=True)
 
 if submitted:
@@ -252,6 +338,12 @@ if submitted:
 
             st.success(f"Listo. Se agregó el registro de **{nombre}**.")
 
+            pedido_out = None
+            if pedido_file:
+                pedido_out = fill_pedido_pdf(
+                    pedido_file.getvalue(), serie, modelo, color_ext, depositos, autorizacion
+                )
+
             st.subheader("Descargas")
             d1, d2 = st.columns(2)
             with d1:
@@ -267,6 +359,14 @@ if submitted:
                     "⬇️ PDF ANEXO 1 rellenado",
                     data=pdf_out,
                     file_name=f"Anexo1_{nombre.replace(' ', '_')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            if pedido_out:
+                st.download_button(
+                    "⬇️ PDF Pedido rellenado",
+                    data=pedido_out,
+                    file_name=f"Pedido_{nombre.replace(' ', '_')}.pdf",
                     mime="application/pdf",
                     use_container_width=True,
                 )
