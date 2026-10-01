@@ -1,11 +1,75 @@
+import base64
 import io
+import os
 import re
 from datetime import date
 
+import requests
 import streamlit as st
 from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+
+GITHUB_API = "https://api.github.com"
+
+
+def get_github_config():
+    """Lee la config de guardado automático desde los 'Secrets' de Streamlit.
+    Si no está configurada, la app funciona como antes (subir el Excel cada vez)."""
+    try:
+        if "GITHUB_TOKEN" not in st.secrets or "GITHUB_REPO" not in st.secrets:
+            return None
+        return {
+            "token": st.secrets["GITHUB_TOKEN"],
+            "repo": st.secrets["GITHUB_REPO"],
+            "path": st.secrets.get("GITHUB_FILE_PATH", "data/Plataforma_Seguimiento_Toyota.xlsx"),
+            "branch": st.secrets.get("GITHUB_BRANCH", "main"),
+        }
+    except Exception:
+        return None
+
+
+def github_get_file(cfg):
+    """Descarga el Excel guardado en el repo. Devuelve (bytes, sha) o (None, None)."""
+    url = f"{GITHUB_API}/repos/{cfg['repo']}/contents/{cfg['path']}"
+    headers = {"Authorization": f"token {cfg['token']}", "Accept": "application/vnd.github+json"}
+    r = requests.get(url, headers=headers, params={"ref": cfg["branch"]}, timeout=20)
+    if r.status_code == 200:
+        data = r.json()
+        return base64.b64decode(data["content"]), data["sha"]
+    return None, None
+
+
+def github_put_file(cfg, content_bytes: bytes, sha, message: str) -> bool:
+    """Sube/actualiza el Excel en el repo. sha=None si el archivo no existía aún."""
+    url = f"{GITHUB_API}/repos/{cfg['repo']}/contents/{cfg['path']}"
+    headers = {"Authorization": f"token {cfg['token']}", "Accept": "application/vnd.github+json"}
+    payload = {
+        "message": message,
+        "content": base64.b64encode(content_bytes).decode("utf-8"),
+        "branch": cfg["branch"],
+    }
+    if sha:
+        payload["sha"] = sha
+    r = requests.put(url, headers=headers, json=payload, timeout=30)
+    return r.status_code in (200, 201)
+
+
+# Carpeta del propio repo donde viven las plantillas PDF en blanco (ya incluidas
+# en el proyecto, no hace falta subirlas cada vez). Si el archivo no existe ahí,
+# la app simplemente pide que lo subas manualmente ese uso.
+TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+ANEXO_TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "ANEXO1_CFDI.pdf")
+PEDIDO_TEMPLATE_PATH = os.path.join(TEMPLATES_DIR, "PEDIDO.pdf")
+
+
+def load_local_template(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception:
+        return None
+
 
 st.set_page_config(page_title="Registro y Facturación - Toyota Corregidora", layout="centered")
 
@@ -117,9 +181,9 @@ def fill_pdf(template_bytes: bytes, data: dict) -> bytes:
 
 
 def fill_pedido_pdf(template_bytes: bytes, serie: str, modelo: str, color_ext: str,
-                     depositos: list, autorizacion: str) -> bytes:
-    """Llena el formato de Pedido: Serie, Modelo (año), Color Ext., hasta 5 filas
-    de depósito (fecha, monto, rec.) y la línea de Autorización Depósito."""
+                     depositos: list) -> bytes:
+    """Llena el formato de Pedido: Serie, Modelo (año), Color Ext. y hasta 5 filas
+    de depósito (fecha, monto, rec.)."""
     reader = PdfReader(io.BytesIO(template_bytes))
     page = reader.pages[0]
     width = float(page.mediabox.width)
@@ -136,9 +200,6 @@ def fill_pedido_pdf(template_bytes: bytes, serie: str, modelo: str, color_ext: s
         draw_fitted_text(c, x_fecha, y, dep.get("fecha", ""), ancho_fecha, base_size=9)
         draw_fitted_text(c, x_monto, y, dep.get("monto", ""), PEDIDO_DEPOSITO_ANCHO_MONTO, base_size=9)
         draw_fitted_text(c, x_rec, y, dep.get("rec", ""), ancho_rec, base_size=9)
-
-    x_a, y_a, max_w_a, size_a = PEDIDO_AUTORIZACION
-    draw_fitted_text(c, x_a, y_a, autorizacion, max_w_a, base_size=size_a)
 
     c.save()
     overlay_buffer.seek(0)
@@ -250,12 +311,36 @@ Correcto?"""
 st.title("Registro y Facturación · Toyota Corregidora")
 st.caption("Sube tus archivos base, llena los datos del cliente y genera todo en un paso.")
 
+github_cfg = get_github_config()
+
 col_up1, col_up2 = st.columns(2)
 with col_up1:
-    excel_file = st.file_uploader("Excel de seguimiento (.xlsx)", type=["xlsx"])
+    if github_cfg:
+        excel_file = st.file_uploader(
+            "Excel de seguimiento (opcional — reemplaza la base guardada)", type=["xlsx"]
+        )
+        st.caption("✅ Guardado automático activo: la base se actualiza sola en GitHub. Solo sube un archivo aquí si quieres reemplazarla por completo.")
+    else:
+        excel_file = st.file_uploader("Excel de seguimiento (.xlsx)", type=["xlsx"])
+anexo_bundled = load_local_template(ANEXO_TEMPLATE_PATH)
+pedido_bundled = load_local_template(PEDIDO_TEMPLATE_PATH)
+
 with col_up2:
-    pdf_file = st.file_uploader("Formato ANEXO 1 - CFDI (.pdf)", type=["pdf"])
-pedido_file = st.file_uploader("Formato de Pedido (.pdf) — opcional", type=["pdf"])
+    if anexo_bundled:
+        pdf_file = st.file_uploader(
+            "Formato ANEXO 1 (opcional — reemplaza la plantilla precargada)", type=["pdf"]
+        )
+        st.caption("✅ Plantilla precargada. Solo sube un PDF aquí si quieres reemplazarla.")
+    else:
+        pdf_file = st.file_uploader("Formato ANEXO 1 - CFDI (.pdf)", type=["pdf"])
+
+if pedido_bundled:
+    pedido_file = st.file_uploader(
+        "Formato de Pedido (opcional — reemplaza la plantilla precargada)", type=["pdf"]
+    )
+    st.caption("✅ Plantilla de Pedido precargada. Solo sube un PDF aquí si quieres reemplazarla.")
+else:
+    pedido_file = st.file_uploader("Formato de Pedido (.pdf) — opcional", type=["pdf"])
 
 st.divider()
 
@@ -268,7 +353,7 @@ with st.form("form_cliente", clear_on_submit=False):
         domicilio = st.text_input("Domicilio Fiscal Completo")
         cp = st.text_input("C.P.")
     with c2:
-        uso_cfdi = st.text_input("Uso de CFDI", value="S01 Sin efectos Fiscales")
+        uso_cfdi = st.text_input("Uso de CFDI")
         regimen = st.text_input("Régimen Fiscal")
         telefono = st.text_input("Teléfono")
         correo = st.text_input("Correo Electrónico")
@@ -312,15 +397,45 @@ with st.form("form_cliente", clear_on_submit=False):
         with dc3:
             r = st.text_input(f"Rec. {i + 1}", key=f"dep_rec_{i}")
         depositos.append({"fecha": f, "monto": m, "rec": r})
-    autorizacion = st.text_input("Autorización Depósito")
 
     submitted = st.form_submit_button("Procesar y Generar Archivos", use_container_width=True)
 
 if submitted:
-    if not excel_file or not pdf_file:
-        st.error("Sube primero el Excel de seguimiento y el PDF del ANEXO 1.")
-    elif not nombre or not rfc:
-        st.error("Nombre Cliente y RFC son obligatorios.")
+    errors = []
+    excel_source_bytes = None
+    excel_sha = None
+    excel_filename = "Plataforma_Seguimiento_Toyota.xlsx"
+
+    if github_cfg:
+        remote_bytes, excel_sha = github_get_file(github_cfg)
+        if excel_file:
+            excel_source_bytes = excel_file.getvalue()
+            excel_filename = excel_file.name
+        elif remote_bytes is not None:
+            excel_source_bytes = remote_bytes
+            excel_filename = os.path.basename(github_cfg["path"])
+        else:
+            errors.append(
+                "No encontré todavía la base en GitHub. Sube el Excel una vez aquí para inicializarla."
+            )
+    elif excel_file:
+        excel_source_bytes = excel_file.getvalue()
+        excel_filename = excel_file.name
+    else:
+        errors.append("Sube el Excel de seguimiento.")
+
+    anexo_source_bytes = pdf_file.getvalue() if pdf_file else anexo_bundled
+    if not anexo_source_bytes:
+        errors.append("Sube el PDF del ANEXO 1 (no hay plantilla precargada).")
+
+    pedido_source_bytes = pedido_file.getvalue() if pedido_file else pedido_bundled
+
+    if not nombre or not rfc:
+        errors.append("Nombre Cliente y RFC son obligatorios.")
+
+    if errors:
+        for e in errors:
+            st.error(e)
     else:
         telefono_wa = re.sub(r"\D", "", telefono)  # solo dígitos, para wa.me
         datos = dict(
@@ -332,49 +447,73 @@ if submitted:
             unidad=unidad, valor_factura=valor_factura, movil=telefono,
         )
         try:
-            excel_out = update_excel(excel_file.getvalue(), datos)
-            pdf_out = fill_pdf(pdf_file.getvalue(), datos)
+            excel_out = update_excel(excel_source_bytes, datos)
+            pdf_out = fill_pdf(anexo_source_bytes, datos)
             mensaje = build_whatsapp_message(datos)
 
-            st.success(f"Listo. Se agregó el registro de **{nombre}**.")
-
             pedido_out = None
-            if pedido_file:
-                pedido_out = fill_pedido_pdf(
-                    pedido_file.getvalue(), serie, modelo, color_ext, depositos, autorizacion
+            if pedido_source_bytes:
+                pedido_out = fill_pedido_pdf(pedido_source_bytes, serie, modelo, color_ext, depositos)
+
+            saved_to_github = None
+            if github_cfg:
+                saved_to_github = github_put_file(
+                    github_cfg, excel_out, excel_sha, f"Nuevo cliente: {nombre}"
                 )
 
-            st.subheader("Descargas")
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    "⬇️ Excel actualizado",
-                    data=excel_out,
-                    file_name=excel_file.name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            with d2:
-                st.download_button(
-                    "⬇️ PDF ANEXO 1 rellenado",
-                    data=pdf_out,
-                    file_name=f"Anexo1_{nombre.replace(' ', '_')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            if pedido_out:
-                st.download_button(
-                    "⬇️ PDF Pedido rellenado",
-                    data=pedido_out,
-                    file_name=f"Pedido_{nombre.replace(' ', '_')}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-            st.subheader("Mensaje para WhatsApp")
-            st.text_area("Copia este texto", value=mensaje, height=380)
-
+            # Se guarda en sesión para que los botones de descarga no desaparezcan
+            # al hacer clic en ellos (cada download_button recarga la página).
+            st.session_state["resultados"] = dict(
+                excel_out=excel_out,
+                excel_filename=excel_filename,
+                pdf_out=pdf_out,
+                pedido_out=pedido_out,
+                mensaje=mensaje,
+                nombre=nombre,
+                saved_to_github=saved_to_github,
+            )
         except ValueError as e:
             st.error(str(e))
         except Exception as e:
             st.error(f"Ocurrió un error procesando los archivos: {e}")
+
+# --- Muestra los resultados de la última vez que se procesó un cliente ---
+# (fuera del "if submitted" para que sobrevivan a los reruns que provoca
+# cada clic en un botón de descarga)
+res = st.session_state.get("resultados")
+if res:
+    st.success(f"Listo. Se agregó el registro de **{res['nombre']}**.")
+    if res["saved_to_github"] is True:
+        st.caption("✅ Base actualizada automáticamente en GitHub.")
+    elif res["saved_to_github"] is False:
+        st.warning("No se pudo guardar automáticamente en GitHub. Descarga el Excel abajo y súbelo tú manualmente.")
+
+    st.subheader("Descargas")
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "⬇️ Excel actualizado",
+            data=res["excel_out"],
+            file_name=res["excel_filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with d2:
+        st.download_button(
+            "⬇️ PDF ANEXO 1 rellenado",
+            data=res["pdf_out"],
+            file_name=f"Anexo1_{res['nombre'].replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    if res["pedido_out"]:
+        st.download_button(
+            "⬇️ PDF Pedido rellenado",
+            data=res["pedido_out"],
+            file_name=f"Pedido_{res['nombre'].replace(' ', '_')}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    st.subheader("Mensaje para WhatsApp")
+    st.text_area("Copia este texto", value=res["mensaje"], height=380)
